@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Arch packaging / makepkg output
+/pkg/
+/*.pkg.tar*
+/*.src.tar*
+/*.log
+/src/LICENSE
+
+# Local secrets and scratch files
+/.env
+/secrets.env
+/subscriptions.yaml
+/tmp/
+/local/
+/plan/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

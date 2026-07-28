@@ -1,0 +1,17 @@
+pkgbase = mihomo-webui-config
+	pkgdesc = Mihomo and MetaCubeXD integration with safe subscription updates
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/REPLACE_OWNER/mihomo-webui-config
+	install = mihomo-webui-config.install
+	arch = any
+	license = MIT
+	depends = mihomo
+	depends = metacubexd-bin
+	depends = python
+	depends = python-yaml
+	optdepends = subconverter-bin: convert raw URI or Base64 subscriptions locally
+	source = LICENSE
+	md5sums = 38efd55eae1bb89892144dc23099e0ec
+
+pkgname = mihomo-webui-config

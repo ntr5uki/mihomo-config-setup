@@ -1,0 +1,4 @@
+proxies:
+  - name: broken
+    type:
+      invalid:

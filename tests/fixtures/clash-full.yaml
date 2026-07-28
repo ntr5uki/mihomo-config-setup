@@ -1,0 +1,18 @@
+mixed-port: 7890
+
+proxies:
+  - name: HK
+    type: ss
+    server: 127.0.0.1
+    port: 8388
+    cipher: aes-128-gcm
+    password: test
+
+proxy-groups:
+  - name: Airport Group
+    type: select
+    proxies:
+      - HK
+
+rules:
+  - MATCH,Airport Group
