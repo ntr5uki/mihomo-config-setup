@@ -1,5 +1,7 @@
 # mihomo-webui-config
 
+English | [简体中文](README.zh-CN.md)
+
 Thin Arch/AUR integration for Mihomo, MetaCubeXD, and safe subscription updates.
 
 The package does not ship a Mihomo core or WebUI copy. It depends on `mihomo`
@@ -16,13 +18,38 @@ Regular subscription updates never rewrite `/etc/mihomo/config.yaml`.
 
 ```bash
 makepkg -si
-sudo mihomo-subscription init
-sudoedit /etc/mihomo-subscription/subscriptions.yaml
-sudoedit /etc/mihomo-subscription/secrets.env
-sudo mihomo-subscription update --strict
-sudo systemctl enable --now mihomo.service
-sudo systemctl enable --now mihomo-subscription-update.timer
+mihomo-webui-setup
 ```
+
+The setup command requests administrator privileges itself, prompts for the
+subscription URL without echoing it, prepares and starts a local subconverter
+when the selected source format needs one, performs the first strict update,
+and enables Mihomo plus the subscription timer. Existing configuration files
+and an existing `pref.ini` are preserved.
+
+For manual or multi-source configuration, the individual
+`mihomo-subscription init` and `update` commands remain available.
+
+For a routine manual update, use the setup command's update subcommand. It
+requests administrator privileges itself and reloads or restarts Mihomo after
+a successful update:
+
+```bash
+mihomo-webui-setup update
+mihomo-webui-setup update --strict
+```
+
+For a server whose WebUI/API should be reachable on a trusted LAN, bind the
+controller to the server's LAN address during the first setup. This does not
+expose the proxy port unless `--allow-proxy-lan` is also passed:
+
+```bash
+mihomo-webui-setup --controller-listen 192.168.1.10:9090
+```
+
+Binding the controller to `0.0.0.0` also exposes it on public interfaces when
+present. Prefer a specific LAN/VPN address, or restrict port 9090 with a
+firewall. The generated API secret remains required by MetaCubeXD.
 
 Open MetaCubeXD at:
 
@@ -58,6 +85,8 @@ Remote converters are rejected by default to avoid leaking subscription tokens.
 - `init` generates a random Mihomo API secret.
 - update logs do not include subscription URLs.
 - provider writes are atomic.
+- provider files are readable by the `mihomo` service user (`root:mihomo`, `0640`; group configurable via `provider_group`).
+- services that do not support `systemctl reload` are restarted instead.
 - update validates the candidate provider with `mihomo -t` before replacing it.
 - failed sources fall back to cached provider data when available.
 - package install does not enable services or perform network access.
@@ -65,8 +94,9 @@ Remote converters are rejected by default to avoid leaking subscription tokens.
 ## Development Checks
 
 ```bash
-python -m py_compile src/mihomo-subscription
+python -m py_compile mihomo-subscription
 pytest
+shellcheck mihomo-webui-setup
 shellcheck mihomo-webui-config.install
 namcap PKGBUILD
 updpkgsums

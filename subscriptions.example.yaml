@@ -6,6 +6,7 @@ settings:
   config_file: /etc/mihomo/config.yaml
   provider_name: subscriptions
   provider_file: providers/subscriptions.yaml
+  provider_group: mihomo
   service_name: mihomo.service
   cache_dir: /var/lib/mihomo-subscription/cache
   timeout_seconds: 30

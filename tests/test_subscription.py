@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import grp
 import importlib.machinery
 import importlib.util
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +14,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "src" / "mihomo-subscription"
+SCRIPT = ROOT / "mihomo-subscription"
 
 
 def load_module():
@@ -130,7 +132,8 @@ class SubscriptionTests(unittest.TestCase):
                     )
 
             provider = yaml.safe_load(provider_bytes)
-            names = [item["name"] for item in provider["payload"]]
+            names = [item["name"] for item in provider["proxies"]]
+            self.assertNotIn("payload", provider)
             self.assertEqual(names, ["[main] HK", "[backup] OLD"])
             self.assertEqual(list(cache_candidates), ["main"])
             self.assertEqual(fallback_sources, ["backup"])
@@ -280,6 +283,145 @@ class SubscriptionTests(unittest.TestCase):
             base = Path(temporary_directory) / "home"
             with self.assertRaisesRegex(sub.SubscriptionError, "home_dir"):
                 sub.ensure_inside(base, Path(temporary_directory) / "outside")
+
+    def test_configures_controller_and_proxy_lan_independently(self):
+        template = (
+            "mixed-port: 7890\n"
+            "allow-lan: false\n"
+            "external-controller: 127.0.0.1:9090\n"
+        )
+
+        configured = sub.configure_mihomo_template(
+            template,
+            controller_listen="192.168.1.10:9090",
+            allow_proxy_lan=False,
+        )
+        document = yaml.safe_load(configured)
+        self.assertEqual(document["external-controller"], "192.168.1.10:9090")
+        self.assertFalse(document["allow-lan"])
+
+        configured = sub.configure_mihomo_template(
+            template,
+            controller_listen=None,
+            allow_proxy_lan=True,
+        )
+        document = yaml.safe_load(configured)
+        self.assertEqual(document["external-controller"], "127.0.0.1:9090")
+        self.assertTrue(document["allow-lan"])
+
+    def test_validates_controller_listen(self):
+        self.assertEqual(
+            sub.validate_controller_listen("[::1]:9090"),
+            "[::1]:9090",
+        )
+        with self.assertRaisesRegex(Exception, "HOST:PORT"):
+            sub.validate_controller_listen("https://example.com:9090/path")
+
+    def test_install_provider_applies_group_and_mode(self):
+        group_name = grp.getgrgid(os.getgid()).gr_name
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            settings = {
+                "home_dir": str(base / "home"),
+                "state_dir": str(base / "state"),
+                "provider_group": group_name,
+            }
+
+            provider_file = sub.install_provider(
+                settings,
+                b"proxies: []\n",
+                {"main": b"payload: []\n"},
+                dry_run=False,
+            )
+
+            stat_result = provider_file.stat()
+            self.assertEqual(stat_result.st_mode & 0o777, 0o640)
+            self.assertEqual(stat_result.st_gid, os.getgid())
+            cache_file = base / "state" / "cache" / "main.yaml"
+            self.assertEqual(cache_file.stat().st_mode & 0o777, 0o600)
+
+    def test_install_provider_keeps_0600_when_group_missing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            settings = {
+                "home_dir": str(base / "home"),
+                "state_dir": str(base / "state"),
+                "provider_group": "definitely-not-a-group-xyz",
+            }
+
+            provider_file = sub.install_provider(
+                settings,
+                b"proxies: []\n",
+                {},
+                dry_run=False,
+            )
+
+            self.assertEqual(provider_file.stat().st_mode & 0o777, 0o600)
+
+    def test_validation_allows_absolute_external_ui(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            home = base / "home"
+            home.mkdir()
+            config_file = home / "config.yaml"
+            config_file.write_text(
+                yaml.safe_dump(
+                    {
+                        "external-ui": "/usr/share/metacubexd",
+                        "proxy-providers": {
+                            "subscriptions": {
+                                "type": "file",
+                                "path": "./providers/subscriptions.yaml",
+                            }
+                        },
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            settings = {
+                "mihomo_binary": "/usr/bin/mihomo",
+                "home_dir": str(home),
+                "config_file": str(config_file),
+            }
+
+            completed = subprocess.CompletedProcess([], 0, stdout="")
+            with mock.patch.object(sub.subprocess, "run", return_value=completed) as run:
+                sub.validate_with_mihomo(settings, b"proxies: []\n")
+
+            validation_environment = run.call_args.kwargs["env"]
+            self.assertIn(
+                "/usr/share/metacubexd",
+                validation_environment["SAFE_PATHS"].split(os.pathsep),
+            )
+
+    def test_reload_falls_back_to_restart_when_not_supported(self):
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if cmd[1] == "show":
+                return subprocess.CompletedProcess(cmd, 0, stdout="no\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout="")
+
+        with mock.patch.object(sub.subprocess, "run", side_effect=fake_run):
+            sub.reload_mihomo({"service_name": "mihomo.service"}, no_reload=False)
+
+        self.assertEqual(calls[-1][:2], ["systemctl", "restart"])
+
+    def test_reload_uses_reload_when_supported(self):
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if cmd[1] == "show":
+                return subprocess.CompletedProcess(cmd, 0, stdout="yes\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout="")
+
+        with mock.patch.object(sub.subprocess, "run", side_effect=fake_run):
+            sub.reload_mihomo({"service_name": "mihomo.service"}, no_reload=False)
+
+        self.assertEqual(calls[-1][:2], ["systemctl", "reload"])
 
 
 if __name__ == "__main__":

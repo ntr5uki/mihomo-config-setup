@@ -6,7 +6,9 @@ import argparse
 import copy
 import fcntl
 import getpass
+import grp
 import ipaddress
+import json
 import os
 import re
 import secrets
@@ -109,6 +111,24 @@ def ensure_inside(base: Path, candidate: Path) -> Path:
         ) from exc
 
     return candidate_resolved
+
+
+def apply_service_group(path: Path, group_name: str, mode: int) -> None:
+    """chgrp + chmod，让以独立用户运行的 mihomo.service 能读取文件。"""
+    if not group_name:
+        return
+
+    try:
+        gid = grp.getgrnam(group_name).gr_gid
+    except KeyError:
+        log(f"警告：用户组 {group_name} 不存在，{path} 保持原属组和权限")
+        return
+
+    try:
+        os.chown(path, -1, gid)
+        os.chmod(path, mode)
+    except PermissionError:
+        log(f"警告：无权将 {path} 的属组设为 {group_name}，请用 root 运行")
 
 
 def expand_environment(value: Any) -> Any:
@@ -630,7 +650,9 @@ def build_candidate(
     if not all_nodes:
         raise SubscriptionError("聚合结果为空，拒绝覆盖现有 provider")
 
-    return dump_yaml({"payload": all_nodes}), cache_candidates, fallback_sources
+    # Mihomo 的 file 类型 proxy-provider 要求顶层字段为 proxies。
+    # payload 是 rule-provider 的格式，写成 payload 会被核心拒绝加载。
+    return dump_yaml({"proxies": all_nodes}), cache_candidates, fallback_sources
 
 
 def validate_with_mihomo(settings: dict[str, Any], provider_bytes: bytes) -> None:
@@ -668,6 +690,26 @@ def validate_with_mihomo(settings: dict[str, Any], provider_bytes: bytes) -> Non
         "./" + candidate_relative.as_posix()
     )
 
+    validation_environment = os.environ.copy()
+    safe_paths: list[str] = []
+    existing_safe_paths = validation_environment.get("SAFE_PATHS", "")
+    if existing_safe_paths:
+        safe_paths.extend(existing_safe_paths.split(os.pathsep))
+
+    configured_safe_paths = settings.get("safe_paths", [])
+    if isinstance(configured_safe_paths, str):
+        safe_paths.append(configured_safe_paths)
+    elif isinstance(configured_safe_paths, list):
+        safe_paths.extend(str(path) for path in configured_safe_paths)
+
+    external_ui = test_document.get("external-ui")
+    if isinstance(external_ui, str) and Path(external_ui).is_absolute():
+        safe_paths.append(external_ui)
+
+    unique_safe_paths = list(dict.fromkeys(path for path in safe_paths if path))
+    if unique_safe_paths:
+        validation_environment["SAFE_PATHS"] = os.pathsep.join(unique_safe_paths)
+
     atomic_write(candidate_absolute, provider_bytes, 0o600)
     atomic_write(test_config, dump_yaml(test_document), 0o600)
 
@@ -679,6 +721,7 @@ def validate_with_mihomo(settings: dict[str, Any], provider_bytes: bytes) -> Non
             text=True,
             timeout=45,
             check=False,
+            env=validation_environment,
         )
 
         if completed.returncode != 0:
@@ -705,6 +748,7 @@ def install_provider(
     provider_file = ensure_inside(home_dir, home_dir / provider_relative)
     state_dir = Path(str(settings.get("state_dir", "/var/lib/mihomo-subscription")))
     cache_dir = Path(str(settings.get("cache_dir", state_dir / "cache")))
+    provider_group = str(settings.get("provider_group", "mihomo"))
 
     if dry_run:
         return provider_file
@@ -718,6 +762,7 @@ def install_provider(
         os.chmod(previous_file, 0o600)
 
     atomic_write(provider_file, provider_bytes, 0o600)
+    apply_service_group(provider_file, provider_group, 0o640)
 
     for source_id, cache_bytes in cache_candidates.items():
         atomic_write(cache_dir / f"{source_id}.yaml", cache_bytes, 0o600)
@@ -737,10 +782,21 @@ def reload_mihomo(settings: dict[str, Any], *, no_reload: bool) -> None:
         log(f"{service_name} 当前未运行，不执行重载")
         return
 
-    completed = subprocess.run(["systemctl", "reload", service_name], check=False)
+    show = subprocess.run(
+        ["systemctl", "show", service_name, "-p", "CanReload", "--value"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    action = "reload" if show.stdout.strip() == "yes" else "restart"
+    if action == "restart":
+        log(f"{service_name} 不支持 reload，改用 restart 使新节点生效")
+
+    completed = subprocess.run(["systemctl", action, service_name], check=False)
     if completed.returncode != 0:
         raise SubscriptionError(
-            f"provider 已更新，但重载 {service_name} 失败；"
+            f"provider 已更新，但 {action} {service_name} 失败；"
             f"请手工执行 systemctl restart {service_name}"
         )
 
@@ -803,7 +859,67 @@ def replace_secret(template: str) -> str:
     return template.replace("__MIHOMO_SECRET__", secrets.token_urlsafe(32))
 
 
+def validate_controller_listen(value: str) -> str:
+    if any(character in value for character in "\r\n"):
+        raise argparse.ArgumentTypeError("controller 地址不能包含换行")
+
+    parsed = urllib.parse.urlsplit("//" + value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"controller 端口无效：{value}") from exc
+
+    if (
+        not parsed.hostname
+        or port is None
+        or port < 1
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise argparse.ArgumentTypeError(
+            "controller 地址必须为 HOST:PORT，例如 127.0.0.1:9090"
+        )
+
+    return value
+
+
+def configure_mihomo_template(
+    template: str,
+    *,
+    controller_listen: str | None,
+    allow_proxy_lan: bool,
+) -> str:
+    if controller_listen is not None:
+        replacement = "external-controller: " + json.dumps(controller_listen)
+        template, count = re.subn(
+            r"(?m)^external-controller:\s*.*$",
+            replacement,
+            template,
+            count=1,
+        )
+        if count != 1:
+            raise SubscriptionError("配置模板缺少 external-controller")
+
+    if allow_proxy_lan:
+        template, count = re.subn(
+            r"(?m)^allow-lan:\s*false\s*$",
+            "allow-lan: true",
+            template,
+            count=1,
+        )
+        if count != 1:
+            raise SubscriptionError("配置模板缺少 allow-lan: false")
+
+    return template
+
+
 def command_init(args: argparse.Namespace) -> int:
+    if args.non_interactive and args.require_subscription:
+        raise SubscriptionError("--non-interactive 不能与 --require-subscription 同时使用")
+
     mihomo_home = Path("/etc/mihomo")
     control_dir = Path("/etc/mihomo-subscription")
     provider_dir = mihomo_home / "providers"
@@ -812,7 +928,7 @@ def command_init(args: argparse.Namespace) -> int:
 
     for directory, mode in (
         (mihomo_home, 0o755),
-        (provider_dir, 0o700),
+        (provider_dir, 0o750),
         (control_dir, 0o700),
         (state_dir, 0o700),
         (cache_dir, 0o700),
@@ -820,17 +936,57 @@ def command_init(args: argparse.Namespace) -> int:
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, mode)
 
+    # mihomo.service 以 mihomo 用户运行，providers 目录需要该组可读
+    apply_service_group(provider_dir, "mihomo", 0o750)
+
     config_file = mihomo_home / "config.yaml"
     control_file = control_dir / "subscriptions.yaml"
     secrets_file = control_dir / "secrets.env"
     provider_file = provider_dir / "subscriptions.yaml"
+    cache_file = mihomo_home / "cache.db"
+
+    if config_file.exists() and (args.controller_listen or args.allow_proxy_lan):
+        raise SubscriptionError(
+            "--controller-listen 与 --allow-proxy-lan 仅用于新建 config.yaml；"
+            "现有配置请手工修改并执行 mihomo -t 校验"
+        )
+
+    def write_config_template() -> None:
+        template = (SHARE_DIR / "config.base.yaml").read_text(encoding="utf-8")
+        template = configure_mihomo_template(
+            template,
+            controller_listen=args.controller_listen,
+            allow_proxy_lan=args.allow_proxy_lan,
+        )
+        atomic_write(config_file, replace_secret(template).encode("utf-8"), 0o600)
+        apply_service_group(config_file, "mihomo", 0o640)
+        log(f"已创建主配置：{config_file}")
 
     if not config_file.exists():
-        template = (SHARE_DIR / "config.base.yaml").read_text(encoding="utf-8")
-        atomic_write(config_file, replace_secret(template).encode("utf-8"), 0o600)
-        log(f"已创建主配置：{config_file}")
+        write_config_template()
     else:
-        log(f"保留已有主配置，不做修改：{config_file}")
+        existing = load_yaml(config_file)
+        providers = existing.get("proxy-providers") if isinstance(existing, dict) else None
+        has_provider = isinstance(providers, dict) and "subscriptions" in providers
+
+        if has_provider:
+            log(f"保留已有主配置，不做修改：{config_file}")
+        elif not args.non_interactive and sys.stdin.isatty() and ask_yes_no(
+            f"已有 {config_file} 缺少 proxy-providers.subscriptions，"
+            "备份后用模板替换？",
+            default=True,
+        ):
+            backup = config_file.with_suffix(".yaml.bak")
+            shutil.copy2(config_file, backup)
+            log(f"已备份原配置：{backup}")
+            write_config_template()
+        else:
+            log(f"保留已有主配置，不做修改：{config_file}")
+            log(
+                "警告：该配置缺少 proxy-providers.subscriptions，"
+                "update 将无法通过校验；请手工合并模板 "
+                f"{SHARE_DIR / 'config.base.yaml'}"
+            )
 
     if not control_file.exists():
         shutil.copy2(SHARE_DIR / "subscriptions.example.yaml", control_file)
@@ -843,8 +999,14 @@ def command_init(args: argparse.Namespace) -> int:
         log(f"已创建订阅密钥文件：{secrets_file}")
 
     if not provider_file.exists():
-        atomic_write(provider_file, dump_yaml({"payload": []}), 0o600)
+        atomic_write(provider_file, dump_yaml({"proxies": []}), 0o600)
+        apply_service_group(provider_file, "mihomo", 0o640)
         log(f"已创建空 provider：{provider_file}")
+
+    if not cache_file.exists():
+        atomic_write(cache_file, b"", 0o600)
+        apply_service_group(cache_file, "mihomo", 0o660)
+        log(f"已创建 Mihomo 状态缓存：{cache_file}")
 
     subscription_url = args.subscription_url
     converter_type = args.converter
@@ -856,12 +1018,19 @@ def command_init(args: argparse.Namespace) -> int:
     elif subscription_url is None and not args.non_interactive and sys.stdin.isatty():
         if existing_url and ask_yes_no("检测到已有 main 订阅，是否复用它配置 main 来源？", default=True):
             subscription_url = existing_url
+        elif args.require_subscription:
+            subscription_url = getpass.getpass("订阅 URL（输入不会回显）：").strip()
+            if not subscription_url:
+                raise SubscriptionError("订阅 URL 不能为空")
         elif ask_yes_no("是否现在配置 main 订阅？", default=False):
             subscription_url = getpass.getpass("订阅 URL（输入不会回显，留空跳过）：").strip()
 
         if subscription_url and converter_type == "direct":
             if ask_yes_no("这个订阅是否是原始 URI/Base64 格式，需要本地 subconverter 转换？", default=False):
                 converter_type = "subconverter"
+
+    if args.require_subscription and subscription_url is None:
+        raise SubscriptionError("必须在交互终端输入订阅 URL，或使用 --subscription-url")
 
     if subscription_url:
         set_env_file_value(secrets_file, "MIHOMO_SUB_MAIN", subscription_url.strip())
@@ -897,6 +1066,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="不询问订阅 URL，只创建模板文件",
     )
     init_parser.add_argument(
+        "--require-subscription",
+        action="store_true",
+        help="交互初始化时要求输入非空的 main 订阅 URL",
+    )
+    init_parser.add_argument(
         "--subscription-url",
         help="初始化时写入 main 订阅 URL；注意 shell 历史可能记录该值",
     )
@@ -905,6 +1079,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("direct", "subconverter"),
         default="direct",
         help="main 订阅格式：direct 为 Clash/Mihomo YAML，subconverter 为原始 URI/Base64",
+    )
+    init_parser.add_argument(
+        "--controller-listen",
+        type=validate_controller_listen,
+        metavar="HOST:PORT",
+        help="新建配置时设置 MetaCubeXD/API 监听地址；默认 127.0.0.1:9090",
+    )
+    init_parser.add_argument(
+        "--allow-proxy-lan",
+        action="store_true",
+        help="新建配置时允许局域网使用 mixed-port；不影响 controller 监听地址",
     )
     init_parser.set_defaults(func=command_init)
 

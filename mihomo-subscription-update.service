@@ -1,6 +1,6 @@
 [Unit]
 Description=Update Mihomo subscription provider
-Documentation=https://github.com/REPLACE_OWNER/mihomo-webui-config
+Documentation=https://aur.archlinux.org/packages/mihomo-webui-config
 Wants=network-online.target
 After=network-online.target
 ConditionPathExists=/etc/mihomo-subscription/subscriptions.yaml

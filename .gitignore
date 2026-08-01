@@ -19,7 +19,7 @@ env/
 /*.pkg.tar*
 /*.src.tar*
 /*.log
-/src/LICENSE
+/src/
 
 # Local secrets and scratch files
 /.env
