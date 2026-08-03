@@ -153,6 +153,30 @@ sudo mihomo-subscription update --strict
 
 在交互提示中选择不复用旧 URL，然后隐藏输入新的 URL 和正确的订阅格式。
 
+## 重置主配置
+
+软件包升级后，可以用最新模板重建 `/etc/mihomo/config.yaml`：
+
+```bash
+paru -Syu
+mihomo-webui-setup reset
+```
+
+`reset` 保留订阅 URL（`secrets.env`）、`subscriptions.yaml`（含订阅格式与
+subconverter 设置）、API secret、`external-controller`、`allow-lan` 及
+`bind-address`/`lan-allowed-ips`/`lan-disallowed-ips`、认证与
+`skip-auth-prefixes`、代理监听端口和当前 `tun` 配置，避免远程服务器重置后
+路由变化导致 SSH 断开，也不会扩大局域网代理的暴露范围。DNS、代理组、规则和
+provider 定义按软件包最新的 `config.base.yaml` 重建，之后版本新增的安全
+默认值会自动生效。
+
+重置前会显示保留与重置的项目并要求确认；自动化环境用 `--yes` 跳过确认，
+`--dry-run` 只渲染、下载并校验而不写任何文件（也不会改动 subconverter）。
+候选主配置和新下载的 provider 会先通过完整的 `mihomo -t` 校验，成功后才
+原子替换正式文件（原配置备份为 `config.yaml.bak`）；替换或 reload 失败时
+自动回滚到原配置与 provider。完成后自动 reload Mihomo，不支持 reload 时
+改用 restart。
+
 ## 订阅格式与 subconverter
 
 `/etc/mihomo-subscription/subscriptions.yaml` 声明订阅来源；URL 推荐保存在权限为
@@ -205,6 +229,8 @@ paru -S subconverter-bin
 - provider 使用原子替换，避免写入中途产生半文件。
 - provider 默认为 `root:mihomo`、`0640`，Mihomo 服务可读而普通用户不可读。
 - 安装候选 provider 前会执行 `mihomo -t` 校验。
+- reset 在替换任何文件前对候选主配置和 provider 执行完整 `mihomo -t` 校验，
+  保留 `config.yaml.bak` 备份，替换或 reload 失败时自动回滚原配置与 provider。
 - 下载失败时可回退到上一份有效缓存。
 - 软件包安装不会自动启用服务或执行网络请求。
 

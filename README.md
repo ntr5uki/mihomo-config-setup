@@ -57,6 +57,25 @@ mihomo-webui-setup update
 mihomo-webui-setup update --strict
 ```
 
+After a package upgrade, rebuild the main config from the latest template:
+
+```bash
+paru -Syu
+mihomo-webui-setup reset
+```
+
+`reset` keeps the subscription URLs, `subscriptions.yaml` (including
+converter settings), the API secret, `external-controller`, `allow-lan`
+together with `bind-address`/`lan-allowed-ips`/`lan-disallowed-ips`, proxy
+authentication and `skip-auth-prefixes`, proxy listen ports, and the current
+`tun` block. DNS, proxy groups, rules, and provider definitions are
+regenerated from the package's latest `config.base.yaml`, so new security
+defaults are picked up automatically. The candidate config and a freshly
+downloaded provider are validated with `mihomo -t` before anything is
+replaced; if replacement or reload fails, the original config and provider
+are rolled back. Use `reset --yes` for automation and `reset --dry-run` to
+preview without writing files.
+
 For a server whose WebUI/API should be reachable on a trusted LAN, bind the
 controller to the server's LAN address during the first setup. This does not
 expose the proxy port unless `--allow-proxy-lan` is also passed:
@@ -106,6 +125,9 @@ Remote converters are rejected by default to avoid leaking subscription tokens.
 - provider files are readable by the `mihomo` service user (`root:mihomo`, `0640`; group configurable via `provider_group`).
 - services that do not support `systemctl reload` are restarted instead.
 - update validates the candidate provider with `mihomo -t` before replacing it.
+- `reset` validates the candidate main config plus provider with `mihomo -t`
+  before replacing anything, keeps a `config.yaml.bak` backup, and rolls back
+  the original config and provider if replacement or reload fails.
 - failed sources fall back to cached provider data when available.
 - package install does not enable services or perform network access.
 

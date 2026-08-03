@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import grp
 import importlib.machinery
 import importlib.util
@@ -436,6 +437,245 @@ class SubscriptionTests(unittest.TestCase):
             sub.reload_mihomo({"service_name": "mihomo.service"}, no_reload=False)
 
         self.assertEqual(calls[-1][:2], ["systemctl", "reload"])
+
+
+class ResetTests(unittest.TestCase):
+    def setUp(self):
+        self.template = yaml.safe_load(
+            (ROOT / "config.base.yaml").read_text(encoding="utf-8")
+        )
+
+    def existing_config(self):
+        return {
+            "mixed-port": 7891,
+            "allow-lan": True,
+            "bind-address": "192.168.10.2",
+            "lan-allowed-ips": ["192.168.10.0/24"],
+            "lan-disallowed-ips": ["192.168.10.99"],
+            "authentication": ["user:pass"],
+            "skip-auth-prefixes": ["192.168.10.0/24"],
+            "external-controller": "192.168.1.10:9090",
+            "secret": "keep-me",
+            "tun": {"enable": True, "stack": "mixed"},
+            "dns": {"enable": False, "nameserver": ["system"]},
+            "rules": ["MATCH,DIRECT"],
+            "proxy-groups": [{"name": "OLD", "type": "select", "proxies": ["DIRECT"]}],
+        }
+
+    def build_reset_environment(self, temporary_directory):
+        base = Path(temporary_directory)
+        home = base / "home"
+        home.mkdir()
+        config_file = home / "config.yaml"
+        config_file.write_text(
+            yaml.safe_dump(self.existing_config(), sort_keys=False),
+            encoding="utf-8",
+        )
+        control_file = base / "subscriptions.yaml"
+        control_file.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "settings": {
+                        "home_dir": str(home),
+                        "config_file": str(config_file),
+                        "state_dir": str(base / "state"),
+                        "cache_dir": str(base / "cache"),
+                        "provider_group": "",
+                        "timeout_seconds": 1,
+                        "max_download_bytes": 4096,
+                    },
+                    "sources": [
+                        {
+                            "id": "main",
+                            "url_env": "MAIN_URL",
+                            "converter": {
+                                "type": "subconverter",
+                                "endpoint": "http://127.0.0.1:25500/sub",
+                                "allow_remote": False,
+                            },
+                        }
+                    ],
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            control_file=control_file,
+            secrets_file=None,
+            template_file=ROOT / "config.base.yaml",
+            yes=True,
+            dry_run=False,
+            no_reload=True,
+        )
+        return base, home, config_file, control_file, args
+
+    def run_reset(self, base, args, fetch_side_effect=None):
+        completed = subprocess.CompletedProcess([], 0, stdout="")
+        fetch = mock.Mock(
+            side_effect=fetch_side_effect,
+            return_value=fixture_text("clash-full.yaml").encode("utf-8"),
+        )
+        with mock.patch.object(sub, "LOCK_FILE", base / "lock"):
+            with mock.patch.dict(os.environ, {"MAIN_URL": "https://example.invalid/main"}):
+                with mock.patch.object(sub, "fetch_url", fetch):
+                    with mock.patch.object(sub.subprocess, "run", return_value=completed):
+                        return sub.command_reset(args)
+
+    def test_render_preserves_server_parameters(self):
+        rendered, preserved = sub.render_reset_config(
+            self.template, self.existing_config()
+        )
+
+        self.assertEqual(rendered["secret"], "keep-me")
+        self.assertEqual(rendered["external-controller"], "192.168.1.10:9090")
+        self.assertTrue(rendered["allow-lan"])
+        self.assertEqual(rendered["bind-address"], "192.168.10.2")
+        self.assertEqual(rendered["lan-allowed-ips"], ["192.168.10.0/24"])
+        self.assertEqual(rendered["lan-disallowed-ips"], ["192.168.10.99"])
+        self.assertEqual(rendered["mixed-port"], 7891)
+        self.assertEqual(rendered["authentication"], ["user:pass"])
+        self.assertEqual(rendered["skip-auth-prefixes"], ["192.168.10.0/24"])
+        self.assertEqual(rendered["tun"], {"enable": True, "stack": "mixed"})
+        self.assertIn("tun", preserved)
+        self.assertIn("lan-allowed-ips", preserved)
+
+    def test_render_applies_template_dns_rules_and_groups(self):
+        rendered, _ = sub.render_reset_config(self.template, self.existing_config())
+
+        self.assertEqual(rendered["dns"], self.template["dns"])
+        self.assertEqual(rendered["rules"], self.template["rules"])
+        self.assertEqual(rendered["proxy-groups"], self.template["proxy-groups"])
+        self.assertEqual(rendered["proxy-providers"], self.template["proxy-providers"])
+
+    def test_render_generates_secret_when_missing(self):
+        existing = self.existing_config()
+        del existing["secret"]
+
+        rendered, preserved = sub.render_reset_config(self.template, existing)
+
+        self.assertNotIn("secret", preserved)
+        self.assertNotEqual(rendered["secret"], sub.SECRET_PLACEHOLDER)
+        self.assertGreaterEqual(len(rendered["secret"]), 32)
+
+    def test_reset_keeps_url_and_converter_untouched(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base, _, _, control_file, args = self.build_reset_environment(
+                temporary_directory
+            )
+            control_before = control_file.read_bytes()
+
+            self.assertEqual(self.run_reset(base, args), 0)
+
+            self.assertEqual(control_file.read_bytes(), control_before)
+            control = yaml.safe_load(control_before)
+            self.assertEqual(control["sources"][0]["url_env"], "MAIN_URL")
+            self.assertEqual(
+                control["sources"][0]["converter"]["type"], "subconverter"
+            )
+
+    def test_reset_writes_preserved_values_and_template_dns(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base, home, config_file, _, args = self.build_reset_environment(
+                temporary_directory
+            )
+
+            self.assertEqual(self.run_reset(base, args), 0)
+
+            document = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+            self.assertEqual(document["secret"], "keep-me")
+            self.assertEqual(document["external-controller"], "192.168.1.10:9090")
+            self.assertTrue(document["allow-lan"])
+            self.assertEqual(document["bind-address"], "192.168.10.2")
+            self.assertEqual(document["lan-allowed-ips"], ["192.168.10.0/24"])
+            self.assertEqual(document["tun"], {"enable": True, "stack": "mixed"})
+            self.assertEqual(document["dns"], self.template["dns"])
+            self.assertEqual(document["rules"], self.template["rules"])
+            self.assertTrue((home / "config.yaml.bak").exists())
+
+            provider = yaml.safe_load(
+                (home / "providers" / "subscriptions.yaml").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [item["name"] for item in provider["proxies"]], ["[main] HK"]
+            )
+
+    def test_reset_download_failure_keeps_old_files(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base, home, config_file, _, args = self.build_reset_environment(
+                temporary_directory
+            )
+            config_before = config_file.read_bytes()
+
+            with self.assertRaises(sub.SubscriptionError):
+                self.run_reset(
+                    base,
+                    args,
+                    fetch_side_effect=sub.SubscriptionError("boom"),
+                )
+
+            self.assertEqual(config_file.read_bytes(), config_before)
+            self.assertFalse((home / "config.yaml.bak").exists())
+            self.assertFalse((home / "providers" / "subscriptions.yaml").exists())
+
+    def test_reset_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base, home, config_file, _, args = self.build_reset_environment(
+                temporary_directory
+            )
+            args.dry_run = True
+            config_before = config_file.read_bytes()
+
+            self.assertEqual(self.run_reset(base, args), 0)
+
+            self.assertEqual(config_file.read_bytes(), config_before)
+            self.assertFalse((home / "config.yaml.bak").exists())
+            self.assertFalse((home / "providers" / "subscriptions.yaml").exists())
+
+    def test_reset_provider_failure_rolls_back_config(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base, home, config_file, _, args = self.build_reset_environment(
+                temporary_directory
+            )
+            config_before = config_file.read_bytes()
+
+            with mock.patch.object(
+                sub,
+                "install_provider",
+                side_effect=sub.SubscriptionError("boom"),
+            ):
+                with self.assertRaises(sub.SubscriptionError) as context:
+                    self.run_reset(base, args)
+
+            self.assertIn("已回滚", str(context.exception))
+            self.assertEqual(config_file.read_bytes(), config_before)
+            self.assertFalse((home / "providers" / "subscriptions.yaml").exists())
+
+    def test_reset_reload_failure_rolls_back_config_and_provider(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base, home, config_file, _, args = self.build_reset_environment(
+                temporary_directory
+            )
+            config_before = config_file.read_bytes()
+            provider_dir = home / "providers"
+            provider_dir.mkdir()
+            provider_file = provider_dir / "subscriptions.yaml"
+            provider_file.write_text("old-provider", encoding="utf-8")
+
+            with mock.patch.object(
+                sub,
+                "reload_mihomo",
+                side_effect=sub.SubscriptionError("reload boom"),
+            ):
+                with self.assertRaises(sub.SubscriptionError) as context:
+                    self.run_reset(base, args)
+
+            self.assertIn("已回滚", str(context.exception))
+            self.assertEqual(config_file.read_bytes(), config_before)
+            self.assertEqual(
+                provider_file.read_text(encoding="utf-8"), "old-provider"
+            )
 
 
 if __name__ == "__main__":
