@@ -33,6 +33,20 @@ def fixture_text(name: str) -> str:
 
 
 class SubscriptionTests(unittest.TestCase):
+    def test_base_config_uses_explicit_dns_upstreams(self):
+        document = yaml.safe_load(
+            (ROOT / "config.base.yaml").read_text(encoding="utf-8")
+        )
+        dns = document["dns"]
+
+        self.assertTrue(dns["enable"])
+        self.assertEqual(dns["enhanced-mode"], "fake-ip")
+        self.assertEqual(dns["default-nameserver"][0], "223.5.5.5")
+        self.assertNotIn("system", dns["default-nameserver"])
+        self.assertNotIn("system", dns["nameserver"])
+        self.assertNotIn("system", dns["proxy-server-nameserver"])
+        self.assertNotIn("geosite", dns["fallback-filter"])
+
     def test_extracts_only_proxies_from_full_clash_config(self):
         proxies = sub.extract_proxies(fixture_text("clash-full.yaml"), "test")
         prefixed = sub.apply_prefix_and_validate_names(

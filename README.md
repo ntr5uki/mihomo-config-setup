@@ -14,11 +14,29 @@ and `metacubexd-bin`, installs conservative templates, and provides
 
 Regular subscription updates never rewrite `/etc/mihomo/config.yaml`.
 
+New configurations enable Mihomo's built-in DNS with explicit mainland-China
+upstreams and never use `nameserver: system`. This prevents a DNS loop when a
+Linux TUN takes over systemd-resolved. TUN remains disabled by default; if it
+is enabled manually, keep every Mihomo DNS upstream independent of the system
+resolver.
+
+The package explicitly depends on AUR `mihomo-bin` and `clash-geoip`, and links
+the latter's database into `/etc/mihomo/Country.mmdb`. The fallback filter
+intentionally avoids `geosite: gfw` because `mihomo-bin` does not provide
+`GeoSite.dat`.
+
 ## Install Flow
 
 ```bash
-makepkg -si
+paru -S mihomo-webui-config
 mihomo-webui-setup
+```
+
+For a manual source build, install the AUR dependencies first:
+
+```bash
+paru -S --needed mihomo-bin metacubexd-bin clash-geoip
+makepkg -si
 ```
 
 The setup command requests administrator privileges itself, prompts for the

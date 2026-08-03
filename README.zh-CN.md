@@ -19,6 +19,22 @@
 
 日常更新只替换这个 provider，不会重写 `/etc/mihomo/config.yaml`。
 
+## 默认 DNS
+
+新建配置默认启用 Mihomo 内置 DNS，使用适合中国大陆网络的显式上游：阿里公共
+DNS、DNSPod Public DNS 和 114DNS；境外 fallback 使用 Cloudflare 与 Google。
+配置不会使用 `nameserver: system`，避免 Linux TUN 接管 systemd-resolved 后把
+DNS 查询再次送回 Mihomo 而形成回环。
+
+默认仍不开启 TUN。自行启用 TUN 时，不要把 `default-nameserver`、`nameserver`、
+`proxy-server-nameserver` 或 `direct-nameserver` 改成 `system`。DNS 上游可按机房
+网络、隐私策略和内网域名需求修改。
+
+默认的 fallback filter 使用依赖包 `clash-geoip` 提供的 `Country.mmdb`。本包会
+创建 `/etc/mihomo/Country.mmdb` 链接供 `mihomo-bin` 使用。没有直接复制 Clash
+Verge 的 `geosite: gfw`，因为 `mihomo-bin` 默认不提供 `GeoSite.dat`，在首次启动
+且代理尚不可用时下载它会增加失败点。
+
 ## 安装
 
 从 AUR 安装：
@@ -27,9 +43,12 @@
 paru -S mihomo-webui-config
 ```
 
+`paru` 会一并解析 AUR 依赖 `mihomo-bin`、`metacubexd-bin` 和 `clash-geoip`。
+
 或者从源码构建：
 
 ```bash
+paru -S --needed mihomo-bin metacubexd-bin clash-geoip
 git clone https://aur.archlinux.org/mihomo-webui-config.git
 cd mihomo-webui-config
 makepkg -si
